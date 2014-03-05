@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Copyright 2012-2013 Nigel Small
+# Copyright 2012-2014 Nigel Small
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,6 +20,10 @@ BASE=`dirname $0`
 python $BASE/test/server/application.py &
 PID=$!
 
-py.test --cov-report term-missing --cov httpstream $BASE/test/
+cd $BASE
+py.test --cov httpstream --cov-report term-missing $*
+EXIT_STATUS=$?
 
 kill $PID
+
+exit $EXIT_STATUS

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-# Copyright 2013, Nigel Small
+# Copyright 2013-2014, Nigel Small
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,38 +19,96 @@
 from __future__ import unicode_literals
 
 from base64 import b64encode
+import errno
 try:
-    from http.client import (BadStatusLine, CannotSendRequest, HTTPConnection,
-                             HTTPSConnection, HTTPException, ResponseNotReady,
+    from http.client import (BadStatusLine, CannotSendRequest,
+                             HTTPConnection as _HTTPConnection,
+                             HTTPSConnection as _HTTPSConnection,
+                             HTTPException, ResponseNotReady,
                              responses)
 except ImportError:
-    from httplib import (BadStatusLine, CannotSendRequest, HTTPConnection,
-                         HTTPSConnection, HTTPException, ResponseNotReady,
+    from httplib import (BadStatusLine, CannotSendRequest,
+                         HTTPConnection as _HTTPConnection,
+                         HTTPSConnection as _HTTPSConnection,
+                         HTTPException, ResponseNotReady,
                          responses)
 import json
 import logging
-import os
-from socket import error, gaierror, herror, timeout
+from os import strerror
+from socket import error, gaierror, herror, timeout, IPPROTO_TCP, TCP_NODELAY
 from threading import local
 import sys
+from xml.dom.minidom import parseString
+
+from jsonstream import JSONStream
+from urimagic import URI, URITemplate
+from urimagic.kvlist import KeyValueList  # no point in another copy
 
 from . import __version__
 from .jsonencoder import JSONEncoder
-from .jsonstream import JSONStream, assembled
 from .numbers import *
-from .uri import URI, URITemplate
 
 
 __all__ = ["NetworkAddressError", "SocketError", "RedirectionError", "Request",
            "Response", "Redirection", "ClientError", "ServerError", "Resource",
            "ResourceTemplate", "get", "put", "post", "delete", "head"]
 
+
+class HTTPConnection(_HTTPConnection):
+    """ Patched class to avoid Nagle's algorithm:
+    https://en.wikipedia.org/wiki/Nagle%27s_algorithm
+    """
+
+    def connect(self):
+        _HTTPConnection.connect(self)
+        self.sock.setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)
+
+
+class HTTPSConnection(_HTTPSConnection):
+    """ Patched class to avoid Nagle's algorithm:
+    https://en.wikipedia.org/wiki/Nagle%27s_algorithm
+    """
+
+    def connect(self):
+        _HTTPSConnection.connect(self)
+        self.sock.setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)
+
+
+connection_classes = {
+    "http": HTTPConnection,
+    "https": HTTPSConnection,
+}
+
 default_encoding = "ISO-8859-1"
 default_chunk_size = 4096
 
 log = logging.getLogger(__name__)
+try:
+    log.addHandler(logging.NullHandler())
+except AttributeError:
+    # Python 2.6
+    class NullHandler(logging.Handler):
+        def emit(self, record):
+            pass
+    log.addHandler(NullHandler())
 
 redirects = {}
+
+# Since the Python docs state that "symbols that are not used on the current
+# platform are not defined by the module" we have to import error codes
+# cautiously. Error numbers also vary across platforms so we cannot rely on
+# raw numeric values either.
+retry_codes = {}
+if hasattr(errno, "EPIPE"):
+    retry_codes[errno.EPIPE] = "broken pipe"
+if hasattr(errno, "ENETRESET"):
+    retry_codes[errno.ENETRESET] = "network reset"
+if hasattr(errno, "ECONNABORTED"):
+    retry_codes[errno.ECONNABORTED] = "connection aborted"
+if hasattr(errno, "ECONNRESET"):
+    retry_codes[errno.ECONNRESET] = "connection reset"
+
+supports_buffering = ((2, 7) <= sys.version_info < (2, 8))
 
 
 def user_agent(product=None):
@@ -86,16 +144,20 @@ class NetworkAddressError(Loggable, IOError):
 
 class SocketError(Loggable, IOError):
 
-    def __init__(self, code, host_port=None):
+    def __init__(self, code, description, host_port=None):
         self._code = code
+        self._description = description
         self._host_port = host_port
-        message = os.strerror(code)
-        IOError.__init__(self, message)
-        Loggable.__init__(self, self.__class__, message)
+        IOError.__init__(self, description)
+        Loggable.__init__(self, self.__class__, description)
 
     @property
     def code(self):
         return self._code
+
+    @property
+    def description(self):
+        return self._description
 
     @property
     def host_port(self):
@@ -115,51 +177,48 @@ class ConnectionPuddle(local):
     necessary; after use, these must be released.
     """
 
-    _http_classes = {
-        "http": HTTPConnection,
-        "https": HTTPSConnection,
-    }
-
-    def __init__(self, scheme, host_port):
+    def __init__(self, connection_class, host_port):
         local.__init__(self)
-        self._scheme = scheme
-        self._host_port = host_port
-        self._active = []
-        self._passive = []
+        self.__connection_class = connection_class
+        self.__host_port = host_port
+        self.__active = []
+        self.__passive = []
 
     @property
     def host_port(self):
-        return self._host_port
+        return self.__host_port
 
     @property
-    def scheme(self):
-        return self._scheme
+    def connection_class(self):
+        return self.__connection_class
 
     def __repr__(self):
-        return "({0}://{1} active={2} passive={3})".format(
-            self.scheme, self.host_port, len(self._active), len(self._passive))
+        return "<{0}({1}) active={2} passive={3}>".format(
+            self.__connection_class.__name__, repr(self.host_port),
+            len(self.__active), len(self.__passive)
+        )
 
     def __hash__(self):
-        return hash((self.scheme, self.host_port))
+        return hash((self.__connection_class, self.host_port))
 
     def __len__(self):
-        return len(self._active) + len(self._passive)
+        return len(self.__active) + len(self.__passive)
 
     def acquire(self):
-        if self._passive:
-            connection = self._passive.pop()
+        if self.__passive:
+            connection = self.__passive.pop()
         else:
-            connection = self._http_classes[self.scheme](self.host_port)
-        self._active.append(connection)
+            connection = self.__connection_class(self.host_port)
+        self.__active.append(connection)
         return connection
 
     def release(self, connection):
         try:
-            self._active.remove(connection)
+            self.__active.remove(connection)
         except ValueError:
             pass
-        if len(self._passive) < 2:
-            self._passive.append(connection)
+        if len(self.__passive) < 2:
+            self.__passive.append(connection)
         else:
             connection.close()
 
@@ -172,34 +231,20 @@ class ConnectionPool(object):
     _puddles = {}
 
     @classmethod
-    def _get_puddle(cls, scheme, host_port):
-        if ":" in host_port:
-            key = (scheme, host_port)
-        elif scheme == "https":
-            key = (scheme, host_port + ":" + str(HTTPS_PORT))
-        elif scheme == "http":
-            key = (scheme, host_port + ":" + str(HTTP_PORT))
-        else:
-            raise ValueError("Unknown scheme " + repr(scheme))
+    def _get_puddle(cls, connection_class, host_port):
+        key = (connection_class, host_port)
         if key not in cls._puddles:
-            cls._puddles[key] = ConnectionPuddle(scheme, host_port)
+            cls._puddles[key] = ConnectionPuddle(connection_class, host_port)
         return cls._puddles[key]
 
     @classmethod
     def acquire(cls, scheme, host_port):
-        puddle = cls._get_puddle(scheme, host_port)
+        puddle = cls._get_puddle(connection_classes[scheme], host_port)
         return puddle.acquire()
 
     @classmethod
     def release(cls, connection):
-        if isinstance(connection, HTTPSConnection):
-            schema = "https"
-        elif isinstance(connection, HTTPConnection):
-            schema = "http"
-        else:
-            raise TypeError("Unknown connection type " +
-                            repr(connection.__class__))
-        puddle = cls._get_puddle(schema, "{0}:{1}".format(
+        puddle = cls._get_puddle(connection.__class__, "{0}:{1}".format(
             connection.host, connection.port))
         puddle.release(connection)
 
@@ -220,7 +265,7 @@ def submit(method, uri, body, headers):
 
     def send(reconnect=None):
         if reconnect:
-            log.warn("<~> Reconnecting ({0})".format(reconnect))
+            log.debug("<~> Reconnecting ({0})".format(reconnect))
             http.close()
             http.connect()
         if method in ("GET", "DELETE") and not body:
@@ -233,7 +278,10 @@ def submit(method, uri, body, headers):
             for key, value in headers.items():
                 log.debug(">>> {0}: {1}".format(key, value))
         http.request(method, uri.absolute_path_reference, body, headers)
-        return http.getresponse()
+        if supports_buffering:
+            return http.getresponse(buffering=True)
+        else:
+            return http.getresponse()
 
     try:
         try:
@@ -252,18 +300,23 @@ def submit(method, uri, body, headers):
                 code = err.args[0][0]
             else:
                 code = err.args[0]
-            if code == 32:
-                # EPIPE: Broken pipe
-                response = send("broken pipe")
+            if code in retry_codes:
+                response = send(retry_codes[code])
             else:
                 raise
     except (gaierror, herror) as err:
         raise NetworkAddressError(err.args[1], host_port=uri.host_port)
     except error as err:
         if isinstance(err.args[0], tuple):
-            code = err.args[0][0]
-        else:
+            code, description = err.args[0]
+        elif isinstance(err.args[0], int):
             code = err.args[0]
+            try:
+                description = strerror(code)
+            except ValueError:
+                description = None
+        else:
+            code, description = None, err.args[0]
         if code == 2:
             # Workaround for Linux bug with incorrect error message on
             # host resolution
@@ -272,7 +325,7 @@ def submit(method, uri, body, headers):
             raise NetworkAddressError("Name or service not known",
                                       host_port=uri.host_port)
         else:
-            raise SocketError(code, host_port=uri.host_port)
+            raise SocketError(code, description, host_port=uri.host_port)
     else:
         return http, response
 
@@ -366,6 +419,7 @@ class Response(object):
         self._request = request
         self._response = response
         self._reason = kwargs.get("reason")
+        self.__headers = KeyValueList(self._response.getheaders())
         #: Default chunk size for this response
         self.chunk_size = kwargs.get("chunk_size", default_chunk_size)
         log.info("<<< {0}".format(self))
@@ -448,7 +502,7 @@ class Response(object):
     def headers(self):
         """ The response headers.
         """
-        return self._response.getheaders()
+        return self.__headers
 
     @property
     def content_length(self):
@@ -495,7 +549,9 @@ class Response(object):
         """ Indicates whether or not the content is JSON.
         """
         return self.content_type in ("application/json",
-                                     "application/x-javascript")
+                                     "application/x-javascript",
+                                     "text/javascript",
+                                     "text/json")
 
     @property
     def json(self):
@@ -508,7 +564,7 @@ class Response(object):
 
     @property
     def is_text(self):
-        """ Indicates whether or not the content is text.
+        """ Indicates whether or not the content is plain text.
         """
         return self.content_type.partition("/")[0] == "text"
 
@@ -516,9 +572,42 @@ class Response(object):
     def text(self):
         """ Fetches all content as a string.
         """
-        if not self.is_text:
+        if not self.is_text and not self.is_json and not self.is_xml:
             raise TypeError("Content is not text")
         return self.read().decode(self.encoding)
+
+    @property
+    def is_tsj(self):
+        """ Indicates whether or not the content is tab-separated JSON.
+        """
+        return self.content_type == "text/x-tab-separated-json"
+
+    @property
+    def tsj(self):
+        """ Fetches all content, decoding from tab-separated JSON and returning
+        the decoded values.
+        """
+        if not self.is_tsj:
+            raise TypeError("Content is not tab-separated JSON")
+        return [
+            [json.loads(value) for value in line.split("\t")]
+            for line in self.read().decode(self.encoding).splitlines()
+        ]
+
+    @property
+    def is_xml(self):
+        """ Indicates whether or not the content is XML.
+        """
+        return self.content_type == "application/xml"
+
+    @property
+    def dom(self):
+        """ Fetches all content, decoding from XML and returning as a DOM
+        object.
+        """
+        if not self.is_xml:
+            raise TypeError("Content is not XML")
+        return parseString(self.read().decode(self.encoding))
 
     @property
     def content(self):
@@ -529,6 +618,8 @@ class Response(object):
             return None
         elif self.is_json:
             return self.json
+        elif self.is_tsj:
+            return self.tsj
         elif self.is_text:
             return self.text
         else:
@@ -545,7 +636,7 @@ class Response(object):
             else:
                 data = self._response.read(size)
                 completed = bool(size and not data)
-            return bytearray(data)
+            return data
         finally:
             if completed:
                 self.close()
@@ -606,11 +697,19 @@ class Response(object):
         if data:
             yield data
 
+    def iter_tsj(self):
+        """ Iterate through the content as lines of tab-separated JSON.
+        """
+        for line in self.iter_lines():
+            yield [json.loads(value) for value in line.split("\t")]
+
     def __iter__(self):
         if self.status_code == NO_CONTENT:
             return iter([])
         elif self.is_json:
             return self.iter_json()
+        elif self.is_tsj:
+            return self.iter_tsj()
         elif self.is_text:
             return self.iter_lines()
         else:

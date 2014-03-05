@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-# Copyright 2013, Nigel Small
+# Copyright 2013-2014, Nigel Small
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,7 +18,9 @@
 
 from __future__ import unicode_literals
 
-from httpstream import Resource, NetworkAddressError, SocketError, ResourceTemplate, URI, URITemplate
+from urimagic import URI, URITemplate
+
+from httpstream import Resource, NetworkAddressError, SocketError, ResourceTemplate
 
 
 def test_bad_hostname_will_fail():

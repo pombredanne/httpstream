@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-# Copyright 2012-2013 Nigel Small
+# Copyright 2012-2014 Nigel Small
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,8 +18,9 @@
 
 from __future__ import unicode_literals
 
+from jsonstream import assembled, grouped
+
 from httpstream import http, Resource, ResourceTemplate, RedirectionError
-from httpstream.jsonstream import assembled, grouped
 from httpstream.numbers import *
 
 
@@ -217,3 +218,20 @@ def test_can_set_product_in_user_agent():
         bits = response.read().decode(response.encoding).split()
         received_product = tuple(bits[0].split("/"))
         assert received_product == test_product
+
+
+def test_cannot_use_unknown_scheme():
+    resource = Resource("xxxx://www.example.com/")
+    try:
+        resource.get()
+    except ValueError:
+        assert True
+    else:
+        assert False
+
+
+def test_can_get_remote_resource():
+    try:
+        Resource("http://www.timeapi.org/utc/now").get()
+    except:
+        pass

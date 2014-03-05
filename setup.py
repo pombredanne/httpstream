@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-# Copyright 2012-2013 Nigel Small
+# Copyright 2012-2014 Nigel Small
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,8 +24,10 @@ incremental receipt and handling of web content.
 
 try:
     from setuptools import setup
+    from setuptools.extension import Extension
 except ImportError:
     from distutils.core import setup
+    from distutils.extension import Extension
 
 from httpstream import __author__, __email__, __license__, __version__
 
@@ -49,10 +51,10 @@ setup(
         "Intended Audience :: Developers",
         "License :: OSI Approved :: Apache Software License",
         "Operating System :: OS Independent",
-        "Programming Language :: Python :: 2.6",
         "Programming Language :: Python :: 2.7",
         "Programming Language :: Python :: 3.3",
         "Topic :: Internet :: WWW/HTTP",
         "Topic :: Software Development",
     ],
+    zip_safe=False,
 )
