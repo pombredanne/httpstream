@@ -19,6 +19,9 @@
 from __future__ import unicode_literals
 
 from base64 import b64encode
+from datetime import datetime
+from .tardis import timezone, datetime_to_timestamp
+from email.utils import formatdate, parsedate_tz, mktime_tz
 import errno
 try:
     from http.client import (BadStatusLine, CannotSendRequest,
@@ -37,12 +40,13 @@ import logging
 from os import strerror
 from socket import error, gaierror, herror, timeout, IPPROTO_TCP, TCP_NODELAY
 from threading import local
+import socket
+import ssl
 import sys
 from xml.dom.minidom import parseString
 
-from jsonstream import JSONStream
-from urimagic import URI, URITemplate
-from urimagic.kvlist import KeyValueList  # no point in another copy
+from .packages.urimagic import URI, URITemplate
+from .packages.urimagic.kvlist import KeyValueList  # no point in another copy
 
 from . import __version__
 from .jsonencoder import JSONEncoder
@@ -50,8 +54,18 @@ from .numbers import *
 
 
 __all__ = ["NetworkAddressError", "SocketError", "RedirectionError", "Request",
-           "Response", "Redirection", "ClientError", "ServerError", "Resource",
-           "ResourceTemplate", "get", "put", "post", "delete", "head"]
+           "Response", "TextResponse", "JSONResponse", "XMLResponse",
+           "Redirection", "ClientError", "ServerError", "Resource",
+           "ResourceTemplate"]
+
+json_content_types = ("application/json", "text/json")
+
+socket_timeout = 30
+
+if sys.version_info >= (3,):
+    is_unicode = lambda x: isinstance(x, str)
+else:
+    is_unicode = lambda x: isinstance(x, unicode)
 
 
 class HTTPConnection(_HTTPConnection):
@@ -60,8 +74,15 @@ class HTTPConnection(_HTTPConnection):
     """
 
     def connect(self):
-        _HTTPConnection.connect(self)
+        """ Connect to the host and port specified at construction.
+        """
+        self.sock = socket.create_connection((self.host, self.port),
+                                             socket_timeout,
+                                             self.source_address)
         self.sock.setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)
+
+        if self._tunnel_host:
+            self._tunnel()
 
 
 class HTTPSConnection(_HTTPSConnection):
@@ -70,9 +91,22 @@ class HTTPSConnection(_HTTPSConnection):
     """
 
     def connect(self):
-        _HTTPSConnection.connect(self)
-        self.sock.setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)
+        """ Connect to the host and port specified at construction over SSL.
+        """
+        sock = socket.create_connection((self.host, self.port),
+                                             socket_timeout,
+                                             self.source_address)
+        sock.setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)
 
+        if self._tunnel_host:
+            self.sock = sock
+            self._tunnel()
+        self.sock = ssl.wrap_socket(sock, self.key_file, self.cert_file)
+
+
+# These are necessary as the type function can't handle unicode in Python 2.7
+client_error_name = str("ClientError")
+server_error_name = str("ServerError")
 
 connection_classes = {
     "http": HTTPConnection,
@@ -82,15 +116,8 @@ connection_classes = {
 default_encoding = "ISO-8859-1"
 default_chunk_size = 4096
 
-log = logging.getLogger(__name__)
-try:
-    log.addHandler(logging.NullHandler())
-except AttributeError:
-    # Python 2.6
-    class NullHandler(logging.Handler):
-        def emit(self, record):
-            pass
-    log.addHandler(NullHandler())
+log = logging.getLogger("httpstream")
+log.addHandler(logging.NullHandler())
 
 redirects = {}
 
@@ -111,6 +138,15 @@ if hasattr(errno, "ECONNRESET"):
 supports_buffering = ((2, 7) <= sys.version_info < (2, 8))
 
 
+def make_uri(uri):
+    if uri is None or isinstance(uri, URI):
+        return uri
+    scheme = uri.partition(":")[0]
+    if scheme not in ("http", "https"):
+        uri = "http://" + uri
+    return URI(uri)
+
+
 def user_agent(product=None):
     ua = []
     if product:
@@ -127,19 +163,17 @@ def user_agent(product=None):
 class Loggable(object):
 
     def __init__(self, cls, message):
-        log.error("!!! {0}: {1}".format(cls.__name__, message))
+        log.error("! %s: %s", cls.__name__, message)
 
 
 class NetworkAddressError(Loggable, IOError):
 
     def __init__(self, message, host_port=None):
-        self._host_port = host_port
+        self.host_port = host_port
+        if host_port:
+            message = "%s: %s" % (message, self.host_port)
         IOError.__init__(self, message)
         Loggable.__init__(self, self.__class__, message)
-
-    @property
-    def host_port(self):
-        return self._host_port
 
 
 class SocketError(Loggable, IOError):
@@ -265,18 +299,18 @@ def submit(method, uri, body, headers):
 
     def send(reconnect=None):
         if reconnect:
-            log.debug("<~> Reconnecting ({0})".format(reconnect))
+            log.info("~ Reconnecting (%s)", reconnect)
             http.close()
             http.connect()
         if method in ("GET", "DELETE") and not body:
-            log.info(">>> {0} {1}".format(method, uri))
+            log.info("> %s %s", method, uri.string)
         elif body:
-            log.info(">>> {0} {1} [{2}]".format(method, uri, len(body)))
+            log.info("> %s %s [%s]", method, uri.string, len(body))
         else:
-            log.info(">>> {0} {1} [0]".format(method, uri))
+            log.info("> %s %s [%s]", method, uri.string, 0)
         if __debug__:
             for key, value in headers.items():
-                log.debug(">>> {0}: {1}".format(key, value))
+                log.debug("> %s: %s", key, value)
         http.request(method, uri.absolute_path_reference, body, headers)
         if supports_buffering:
             return http.getresponse(buffering=True)
@@ -336,46 +370,57 @@ class Request(object):
         if not uri:
             raise ValueError("No URI specified for request")
         #: HTTP method of this request
-        self.method = method
-        self.uri = uri
-        self._headers = dict(headers or {})
-        self.body = body
+        self.__method = method
+        self.__uri = make_uri(uri)
+        self.__headers = dict(headers or {})
+        if isinstance(body, (set, frozenset)):
+            body = list(body)
+        if body is None:
+            self.__body = body
+        elif isinstance(body, (dict, list, tuple)):
+            self.__headers.setdefault("Content-Type", "application/json")
+            self.__body = json.dumps(body, cls=JSONEncoder, separators=",:")
+        elif is_unicode(body):
+            self.__headers.setdefault("Content-Type", "text/plain; charset=UTF-8")
+            self.__body = body.encode("utf-8")
+        elif isinstance(body, bytes):
+            self.__headers.setdefault("Content-Type", "application/octet-stream")
+            self.__body = body
+        else:
+            raise ValueError("Unsupported type for request body: %s" % body.__class__.__name__)
+
+    def __repr__(self):
+        body = self.body
+        if body:
+            return "%s %s [%s]" % (self.method, self.uri, len(body))
+        else:
+            return "%s %s" % (self.method, self.uri)
 
     @property
     def __uri__(self):
         return self.uri
 
     @property
+    def method(self):
+        return self.__method
+
+    @property
     def uri(self):
         """ URI of the request.
         """
-        return self._uri
-
-    @uri.setter
-    def uri(self, value):
-        self._uri = URI(value)
+        return self.__uri
 
     @property
     def body(self):
         """ Content of the request.
         """
-        if isinstance(self._body, (dict, list, tuple)):
-            return json.dumps(self._body, cls=JSONEncoder,
-                              separators=(",", ":"))
-        else:
-            return self._body
-
-    @body.setter
-    def body(self, value):
-        self._body = value
+        return self.__body
 
     @property
     def headers(self):
         """ Dictionary of headers attached to the request.
         """
-        if isinstance(self._body, (dict, list, tuple)):
-            self._headers.setdefault("Content-Type", "application/json")
-        return self._headers
+        return self.__headers
 
     def submit(self, redirect_limit=0, product=None, **response_kwargs):
         """ Submit this request and return a
@@ -388,11 +433,13 @@ class Request(object):
             http, rs = submit(self.method, uri, self.body, headers)
             status_class = rs.status // 100
             if status_class == 3:
-                redirection = Redirection(http, uri, self, rs,
-                                          **response_kwargs)
+                redirection = Redirection(http, uri, self, rs, **response_kwargs)
                 if redirect_limit:
                     redirect_limit -= 1
-                    location = URI.resolve(uri, rs.getheader("Location"))
+                    location_string = rs.getheader("Location", None)
+                    if location_string is None:
+                        return redirection
+                    location = URI.resolve(uri, location_string)
                     if location == uri:
                         raise RedirectionError("Circular redirection")
                     if rs.status in (MOVED_PERMANENTLY, PERMANENT_REDIRECT):
@@ -401,46 +448,87 @@ class Request(object):
                     redirection.close()
                 else:
                     return redirection
-            elif status_class == 4:
-                raise ClientError(http, uri, self, rs, **response_kwargs)
-            elif status_class == 5:
-                raise ServerError(http, uri, self, rs, **response_kwargs)
             else:
-                return Response(http, uri, self, rs, **response_kwargs)
+                return Response.wrap(http, uri, self, rs, **response_kwargs)
+
+
+class ContentConsumed(Exception):
+    pass
 
 
 class Response(object):
     """ File-like object allowing consumption of an HTTP response.
     """
 
+    @staticmethod
+    def wrap(http, uri, request, response, **kwargs):
+        """ Factory method to return an instance of an appropriate Response
+        subclass.
+        """
+        content_type_header = response.getheader("Content-Type")
+        if content_type_header:
+            content_type = content_type_header.partition(";")[0].strip()
+        else:
+            content_type = None
+        if content_type in json_content_types:
+            cls = JSONResponse
+        elif content_type in ("application/xml",):
+            cls = XMLResponse
+        elif content_type and content_type.startswith("text/"):
+            cls = TextResponse
+        else:
+            cls = Response
+        status_class = response.status // 100
+        if status_class == 4:
+            cls = type(client_error_name, (cls, ClientError), {})
+        elif status_class == 5:
+            cls = type(server_error_name, (cls, ServerError), {})
+        inst = cls(http, uri, request, response, **kwargs)
+        if isinstance(inst, Exception):
+            Exception.__init__(inst, "%s %s" % (response.status, response.reason))
+            raise inst
+        else:
+            return inst
+
     def __init__(self, http, uri, request, response, **kwargs):
-        self._http = http
-        self._uri = URI(uri)
-        self._request = request
-        self._response = response
-        self._reason = kwargs.get("reason")
-        self.__headers = KeyValueList(self._response.getheaders())
+        self.__http = http
+        if isinstance(uri, URI):
+            self.__uri = uri
+        else:
+            self.__uri = URI(uri)
+        self.__request = request
+        self.__response = response
+        self.__consumed = False
+        if kwargs.get("cache"):
+            self.__cached = bytearray()
+        else:
+            self.__cached = None
+        self.__reason = kwargs.get("reason")
+        self.__headers = KeyValueList(self.__response.getheaders())
         #: Default chunk size for this response
         self.chunk_size = kwargs.get("chunk_size", default_chunk_size)
-        log.info("<<< {0}".format(self))
+        if self.is_chunked:
+            content_length = "chunked"
+        else:
+            content_length = self.content_length
+        log.info("< %s %s [%s]", self.status_code, self.reason, content_length)
         if __debug__:
-            for key, value in self._response.getheaders():
-                log.debug("<<< {0}: {1}".format(key, value))
+            for key, value in self.__response.getheaders():
+                log.debug("< %s: %s", key, value)
 
     def __del__(self):
         self.close()
 
     def __repr__(self):
         if self.is_chunked:
-            return "{0} {1} [chunked]".format(self.status_code, self.reason)
+            return "%s %s [chunked]" % (self.status_code, self.reason)
         else:
-            return "{0} {1} [{2}]".format(self.status_code, self.reason,
-                                          self.content_length)
+            return "%s %s [%s]" % (self.status_code, self.reason, self.content_length)
 
     def __getitem__(self, key):
-        if not self._response:
+        if not self.__response:
             return None
-        return self._response.getheader(key)
+        return self.__response.getheader(key)
 
     def __enter__(self):
         return self
@@ -449,52 +537,74 @@ class Response(object):
         self.close()
         return False
 
+    def __iter__(self):
+        """ Iterate through the content as bytes.
+        """
+        return iter(self.content or b"")
+
+    @property
+    def cache(self):
+        """ Flag to indicate whether or not content will be cached.
+        """
+        return self.__cached is not None
+
+    @property
+    def consumed(self):
+        """ Flag to indicate whether or not content has been consumed.
+        """
+        return self.__consumed
+
     @property
     def closed(self):
-        """ Indicates whether or not the response is closed.
+        """ Flag to indicate whether or not the response is closed.
         """
-        return not bool(self._http)
+        return not bool(self.__http)
 
     def close(self):
         """ Close the response, discarding all remaining content and releasing
         the underlying connection object.
         """
-        if self._http:
+        if self.__http:
             try:
-                self._response.read()
+                if self.cache:
+                    self.__cached += self.__response.read()
+                else:
+                    self.__response.read()
             except HTTPException:
                 pass
-            ConnectionPool.release(self._http)
-            self._http = None
+            else:
+                self.__consumed = True
+            ConnectionPool.release(self.__http)
+            self.__http = None
 
     @property
     def __uri__(self):
-        return self._uri
+        return self.__uri
 
     @property
     def uri(self):
         """ The URI from which the response came.
         """
-        return self._uri
+        return self.__uri
 
     @property
     def request(self):
         """ The :py:class:`Request` object which preceded this response.
         """
-        return self._request
+        return self.__request
 
     @property
     def status_code(self):
         """ The status code of the response
         """
-        return self._response.status
+        return self.__response.status
 
     @property
     def reason(self):
         """ The reason phrase attached to this response.
         """
-        if self._reason:
-            return self._reason
+        if self.__reason:
+            return self.__reason
         else:
             return responses[self.status_code]
 
@@ -505,12 +615,25 @@ class Response(object):
         return self.__headers
 
     @property
+    def content(self):
+        """ Fetch and return all content.
+        """
+        if self.status_code == NO_CONTENT:
+            return None
+        elif self.__consumed and self.cache:
+            if isinstance(self.__cached, bytearray):
+                self.__cached = bytes(self.__cached)
+            return self.__cached
+        else:
+            return self.read()
+
+    @property
     def content_length(self):
         """ The length of content as provided by the `Content-Length` header
         field. If the content is chunked, this returns :py:const:`None`.
         """
         if not self.is_chunked:
-            return int(self._response.getheader("Content-Length", 0))
+            return int(self.__response.getheader("Content-Length", 0))
 
     @property
     def content_type(self):
@@ -519,11 +642,17 @@ class Response(object):
         try:
             content_type = [
                 _.strip()
-                for _ in self._response.getheader("Content-Type").split(";")
+                for _ in self.__response.getheader("Content-Type").split(";")
             ]
         except AttributeError:
             return None
         return content_type[0]
+
+    @property
+    def date(self):
+        """ The value of the `Date` header, if available.
+        """
+        return self._get_date_header("Date")
 
     @property
     def encoding(self):
@@ -532,116 +661,117 @@ class Response(object):
         try:
             content_type = dict(
                 _.strip().partition("=")[0::2]
-                for _ in self._response.getheader("Content-Type").split(";")
+                for _ in self.__response.getheader("Content-Type").split(";")
             )
         except AttributeError:
             return default_encoding
         return content_type.get("charset", default_encoding)
 
     @property
+    def expires(self):
+        """ The value of the `Expires` header, if available.
+        """
+        return self._get_date_header("Expires")
+
+    @property
+    def filename(self):
+        """ The suggested filename from the `Content-Disposition` header field
+        or the final segment of the path name if no such header is available.
+        """
+        default_filename = self.uri.path.segments[-1]
+        try:
+            content_type = dict(
+                _.strip().partition("=")[0::2]
+                for _ in self.__response.getheader("Content-Disposition").split(";")
+            )
+        except AttributeError:
+            return default_filename
+        return content_type.get("filename", default_filename)
+
+    @property
     def is_chunked(self):
         """ Indicates whether or not the content is chunked.
         """
-        return self._response.getheader("Transfer-Encoding") == "chunked"
+        return self.__response.getheader("Transfer-Encoding") == "chunked"
 
     @property
-    def is_json(self):
-        """ Indicates whether or not the content is JSON.
+    def last_modified(self):
+        """ The value of the `Last-Modified` header, if available.
         """
-        return self.content_type in ("application/json",
-                                     "application/x-javascript",
-                                     "text/javascript",
-                                     "text/json")
+        return self._get_date_header("Last-Modified")
 
     @property
-    def json(self):
-        """ Fetch all content, decoding from JSON and returning the decoded
-        value.
+    def location(self):
+        """ The value of the `Location` header, if available.
         """
-        if not self.is_json:
-            raise TypeError("Content is not JSON")
-        return json.loads(self.read().decode(self.encoding))
+        return self.__response.getheader("Location", None)
 
-    @property
-    def is_text(self):
-        """ Indicates whether or not the content is plain text.
+    def read(self, size=None):
+        """ Fetch some or all of the response content as raw bytes.
         """
-        return self.content_type.partition("/")[0] == "text"
+        if self.__consumed:
+            raise ContentConsumed("All available response content has already "
+                                  "been consumed")
+        try:
+            if size is None:
+                data = self.__response.read()
+                self.__consumed = True
+            else:
+                data = self.__response.read(size)
+                self.__consumed = bool(size and not data)
+            if self.cache:
+                self.__cached += data
+            return data
+        finally:
+            if self.__consumed:
+                self.close()
 
-    @property
-    def text(self):
-        """ Fetches all content as a string.
+    def _get_date_header(self, name):
+        """ Get the value of the specified header interpreted as an HTTP date and return
+        as an aware Python `datetime` instance, or `None` if the header is unavailable.
         """
-        if not self.is_text and not self.is_json and not self.is_xml:
-            raise TypeError("Content is not text")
-        return self.read().decode(self.encoding)
+        date = self.__response.getheader(name, None)
+        if date:
+            return datetime.fromtimestamp(mktime_tz(parsedate_tz(date)), timezone.utc)
+        else:
+            return None
 
-    @property
-    def is_tsj(self):
-        """ Indicates whether or not the content is tab-separated JSON.
-        """
-        return self.content_type == "text/x-tab-separated-json"
 
-    @property
-    def tsj(self):
-        """ Fetches all content, decoding from tab-separated JSON and returning
-        the decoded values.
-        """
-        if not self.is_tsj:
-            raise TypeError("Content is not tab-separated JSON")
-        return [
-            [json.loads(value) for value in line.split("\t")]
-            for line in self.read().decode(self.encoding).splitlines()
-        ]
 
-    @property
-    def is_xml(self):
-        """ Indicates whether or not the content is XML.
-        """
-        return self.content_type == "application/xml"
+class Redirection(Response):
 
-    @property
-    def dom(self):
-        """ Fetches all content, decoding from XML and returning as a DOM
-        object.
-        """
-        if not self.is_xml:
-            raise TypeError("Content is not XML")
-        return parseString(self.read().decode(self.encoding))
+    def __init__(self, http, uri, request, response, **kwargs):
+        assert response.status // 100 == 3
+        Response.__init__(self, http, uri, request, response, **kwargs)
+
+
+class ClientError(Exception):
+    pass
+
+
+class ServerError(Exception):
+    pass
+
+
+class TextResponse(Response):
+
+    def __init__(self, *args, **kwargs):
+        super(TextResponse, self).__init__(*args, **kwargs)
+        self.__cached = None
 
     @property
     def content(self):
-        """ Fetch all content, returning a value appropriate for the content
-        type.
+        """ Fetches all content as a string.
         """
-        if self.status_code == NO_CONTENT:
-            return None
-        elif self.is_json:
-            return self.json
-        elif self.is_tsj:
-            return self.tsj
-        elif self.is_text:
-            return self.text
+        if self.cache:
+            if self.__cached is None:
+                self.__cached = \
+                    super(TextResponse, self).content.decode(self.encoding)
+            return self.__cached
         else:
-            return self.read()
+            return super(TextResponse, self).content.decode(self.encoding)
 
-    def read(self, size=None):
-        """ Fetch some or all of the response content, returning as a bytearray.
-        """
-        completed = False
-        try:
-            if size is None:
-                data = self._response.read()
-                completed = True
-            else:
-                data = self._response.read(size)
-                completed = bool(size and not data)
-            return data
-        finally:
-            if completed:
-                self.close()
-
-    def iter_chunks(self, chunk_size=None):
+    def chunks(self, chunk_size=None):
         """ Iterate through the content as chunks of text. Chunk sizes may vary
         slightly from that specified due to multi-byte characters. If no chunk
         size is specified, a default of 4096 is used.
@@ -667,16 +797,11 @@ class Response(object):
         finally:
             self.close()
 
-    def iter_json(self):
-        """ Iterate through the content as individual JSON values.
-        """
-        return iter(JSONStream(self.iter_chunks()))
-
-    def iter_lines(self, keep_ends=False):
+    def lines(self, keep_ends=False):
         """ Iterate through the content as lines of text.
         """
         data = ""
-        for chunk in self.iter_chunks():
+        for chunk in self.chunks():
             data += chunk
             while "\r" in data or "\n" in data:
                 cr, lf = data.find("\r"), data.find("\n")
@@ -697,46 +822,57 @@ class Response(object):
         if data:
             yield data
 
-    def iter_tsj(self):
-        """ Iterate through the content as lines of tab-separated JSON.
+    def __iter__(self):
+        """ Iterate through the content as lines of text.
         """
-        for line in self.iter_lines():
-            yield [json.loads(value) for value in line.split("\t")]
+        return self.lines()
+
+
+class JSONResponse(TextResponse):
+
+    def __init__(self, *args, **kwargs):
+        super(JSONResponse, self).__init__(*args, **kwargs)
+        self.__cached = None
+
+    @property
+    def content(self):
+        """ Fetch all content, decoding from JSON and returning the decoded
+        value.
+        """
+        if self.cache:
+            if self.__cached is None:
+                self.__cached = json.loads(super(JSONResponse, self).content)
+            return self.__cached
+        else:
+            return json.loads(super(JSONResponse, self).content)
 
     def __iter__(self):
-        if self.status_code == NO_CONTENT:
-            return iter([])
-        elif self.is_json:
-            return self.iter_json()
-        elif self.is_tsj:
-            return self.iter_tsj()
-        elif self.is_text:
-            return self.iter_lines()
+        """ Iterate through the content as individual JSON values.
+        """
+        try:
+            from jsonstream import JSONStream
+        except ImportError:
+            from ..jsonstream import JSONStream
+        return iter(JSONStream(self.chunks()))
+
+
+class XMLResponse(TextResponse):
+
+    def __init__(self, *args, **kwargs):
+        super(XMLResponse, self).__init__(*args, **kwargs)
+        self.__cached = None
+
+    @property
+    def content(self):
+        """ Fetches all content, decoding from XML and returning as a DOM
+        object.
+        """
+        if self.cache:
+            if self.__cached is None:
+                self.__cached = parseString(super(XMLResponse, self).content)
+            return self.__cached
         else:
-            return self.iter_chunks()
-
-
-class Redirection(Response):
-
-    def __init__(self, http, uri, request, response, **kwargs):
-        assert response.status // 100 == 3
-        Response.__init__(self, http, uri, request, response, **kwargs)
-
-
-class ClientError(Exception, Response):
-
-    def __init__(self, http, uri, request, response, **kwargs):
-        assert response.status // 100 == 4
-        Response.__init__(self, http, uri, request, response, **kwargs)
-        Exception.__init__(self, self.reason)
-
-
-class ServerError(Exception, Response):
-
-    def __init__(self, http, uri, request, response, **kwargs):
-        assert response.status // 100 == 5
-        Response.__init__(self, http, uri, request, response, **kwargs)
-        Exception.__init__(self, self.reason)
+            return parseString(super(XMLResponse, self).content)
 
 
 class Resource(object):
@@ -744,48 +880,69 @@ class Resource(object):
     """
 
     def __init__(self, uri):
-        self._uri = URI(uri)
+        self.__uri = make_uri(uri)
 
     def __str__(self):
-        return "<{0}>".format(str(self._uri))
+        uri = self.uri
+        if uri is None:
+            return "<>"
+        else:
+            return "<%s>" % uri.string
 
     def __repr__(self):
-        return "{0}({1})".format(self.__class__.__name__,
-                                 repr(self._uri.string))
+        uri = self.uri
+        if uri is None:
+            return "%s(None)" % self.__class__.__name__
+        else:
+            return "%s(%s)" % (self.__class__.__name__, repr(uri.string))
 
     def __eq__(self, other):
         """ Determine equality of two objects based on URI.
         """
-        return self._uri == other._uri
+        return self.uri == other.uri
 
     def __ne__(self, other):
         """ Determine inequality of two objects based on URI.
         """
-        return self._uri != other._uri
+        return not self.__eq__(other)
 
     def __bool__(self):
-        return bool(self._uri)
+        return bool(self.uri)
 
     def __nonzero__(self):
-        return bool(self._uri)
+        return bool(self.uri)
 
     @property
     def __uri__(self):
-        return self._uri
+        return self.uri
 
     @property
     def uri(self):
         """ The URI of this resource.
         """
-        return self._uri
+        return self.__uri
 
     def resolve(self, reference, strict=True):
         """ Resolve a URI reference against the URI for this resource,
         returning a new resource represented by the new target URI.
         """
-        return Resource(self._uri.resolve(reference, strict))
+        return Resource(self.uri.resolve(reference, strict))
 
-    def get(self, headers=None, redirect_limit=5, **kwargs):
+    def __get_or_head(self, method, if_modified_since=None, headers=None, redirect_limit=5, **kwargs):
+        """ Issue a ``GET`` or ``HEAD`` request to this resource.
+        """
+        headers = dict(headers or {})
+        if if_modified_since:
+            headers["If-Modified-Since"] = formatdate(datetime_to_timestamp(if_modified_since), usegmt=True)
+        rq = Request(method, self.uri, None, headers)
+        return rq.submit(redirect_limit=redirect_limit, **kwargs)
+
+    def head(self, if_modified_since=None, headers=None, redirect_limit=5, **kwargs):
+        """ Issue a ``HEAD`` request to this resource.
+        """
+        return self.__get_or_head("HEAD", if_modified_since, headers, redirect_limit, **kwargs)
+
+    def get(self, if_modified_since=None, headers=None, redirect_limit=5, **kwargs):
         """ Issue a ``GET`` request to this resource.
 
         :param headers: headers to be included in the request (optional)
@@ -796,35 +953,36 @@ class Resource(object):
             be listed in the ``User-Agent`` header (optional)
         :param chunk_size: number of bytes to retrieve per chunk (optional,
             default=4096)
+        :param cache: flag to indicate whether to turn on caching so that
+            response content can be stored for multiple reads (optional)
         :return: file-like :py:class:`Response <httpstream.http.Response>`
             object from which content can be read
         """
-        rq = Request("GET", self._uri, None, headers)
-        return rq.submit(redirect_limit=redirect_limit, **kwargs)
+        return self.__get_or_head("GET", if_modified_since, headers, redirect_limit, **kwargs)
 
     def put(self, body=None, headers=None, **kwargs):
         """ Issue a ``PUT`` request to this resource.
         """
-        rq = Request("PUT", self._uri, body, headers)
+        rq = Request("PUT", self.uri, body, headers)
+        return rq.submit(**kwargs)
+
+    def patch(self, body=None, headers=None, **kwargs):
+        """ Issue a ``PATCH`` request to this resource.
+        """
+        rq = Request("PATCH", self.uri, body, headers)
         return rq.submit(**kwargs)
 
     def post(self, body=None, headers=None, **kwargs):
         """ Issue a ``POST`` request to this resource.
         """
-        rq = Request("POST", self._uri, body, headers)
+        rq = Request("POST", self.uri, body, headers)
         return rq.submit(**kwargs)
 
     def delete(self, headers=None, **kwargs):
         """ Issue a ``DELETE`` request to this resource.
         """
-        rq = Request("DELETE", self._uri, None, headers)
+        rq = Request("DELETE", self.uri, None, headers)
         return rq.submit(**kwargs)
-
-    def head(self, headers=None, redirect_limit=5, **kwargs):
-        """ Issue a ``HEAD`` request to this resource.
-        """
-        rq = Request("HEAD", self._uri, None, headers)
-        return rq.submit(redirect_limit=redirect_limit, **kwargs)
 
 
 class ResourceTemplate(object):
@@ -864,23 +1022,3 @@ class ResourceTemplate(object):
         """ Expand this template into a full URI using the values provided.
         """
         return Resource(self._uri_template.expand(**values))
-
-
-def get(uri, headers=None, redirect_limit=5, **kwargs):
-    return Resource(uri).get(headers, redirect_limit, **kwargs)
-
-
-def put(uri, body=None, headers=None, **kwargs):
-    return Resource(uri).put(body, headers, **kwargs)
-
-
-def post(uri, body=None, headers=None, **kwargs):
-    return Resource(uri).post(body, headers, **kwargs)
-
-
-def delete(uri, headers=None, **kwargs):
-    return Resource(uri).delete(headers, **kwargs)
-
-
-def head(uri, headers=None, redirect_limit=5, **kwargs):
-    return Resource(uri).head(headers, redirect_limit, **kwargs)

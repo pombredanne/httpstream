@@ -18,9 +18,8 @@
 
 from __future__ import unicode_literals
 
-from urimagic import URI, URITemplate
-
 from httpstream import Resource, NetworkAddressError, SocketError, ResourceTemplate
+from httpstream.packages.urimagic import URI, URITemplate
 
 
 def test_bad_hostname_will_fail():
@@ -47,16 +46,14 @@ def test_bad_port_will_fail():
 
 
 def test_can_get_simple_uri():
-    ddg = Resource("http://duckduckgo.com")
-    rs = ddg.get()
+    resource = Resource("http://localhost:8080/person/")
+    rs = resource.get()
     assert rs.status_code == 200
 
 
 def test_can_get_substituted_uri():
-    ddg = Resource("https://api.duckduckgo.com/?q={q}&format=json")
-    rs = ddg.get(q="neo4j")
-    for key, value in rs:
-        print(key, value)
+    resource = ResourceTemplate("http://localhost:8080/person/{name}")
+    rs = resource.expand(name="alice").get()
     assert rs.status_code == 200
 
 
@@ -70,34 +67,11 @@ def test_can_create_none_resource():
     assert str(resource) == "<>"
 
 
-def test_can_create_resource_from_empty_string():
-    resource = Resource("")
-    assert resource.uri == URI("")
-    assert not bool(resource)
-    assert str(resource) == "<>"
-
-
 def test_can_create_resource_from_string():
     resource = Resource("http://example.com/foo")
     assert resource.uri == URI("http://example.com/foo")
     assert bool(resource)
     assert str(resource) == "<http://example.com/foo>"
-
-
-def test_can_create_resource_from_none_uri():
-    uri = URI(None)
-    resource = Resource(uri)
-    assert resource.uri == uri
-    assert not bool(resource)
-    assert str(resource) == "<>"
-
-
-def test_can_create_resource_from_empty_uri():
-    uri = URI("")
-    resource = Resource(uri)
-    assert resource.uri == uri
-    assert not bool(resource)
-    assert str(resource) == "<>"
 
 
 def test_can_create_resource_from_uri():

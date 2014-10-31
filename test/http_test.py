@@ -20,7 +20,7 @@ from __future__ import unicode_literals
 
 from jsonstream import assembled, grouped
 
-from httpstream import http, Resource, ResourceTemplate, RedirectionError
+from httpstream import http, Resource, ResourceTemplate, RedirectionError, TextResponse, JSONResponse
 from httpstream.numbers import *
 
 
@@ -86,15 +86,26 @@ def test_can_set_default_encoding():
 def test_can_get_simple_text_resource():
     resource = Resource("http://localhost:8080/hello")
     response = resource.get()
-    assert response.is_text
+    assert isinstance(response, TextResponse)
     content = response.read().decode(response.encoding)
     assert content == "hello, world"
+
+
+def test_can_get_simple_text_resource_with_caching():
+    resource = Resource("http://localhost:8080/hello")
+    response = resource.get(cache=True)
+    assert response.content_type.startswith("text/")
+    assert isinstance(response, TextResponse)
+    assert not response.consumed
+    assert response.content == "hello, world"
+    assert response.consumed
+    assert response.content == "hello, world"
 
 
 def test_can_put_simple_text_resource():
     resource = Resource("http://localhost:8080/hello")
     response = resource.put("fred")
-    assert response.is_text
+    assert isinstance(response, TextResponse)
     content = response.read().decode("utf-8")
     assert content == "hello, fred"
 
@@ -102,7 +113,7 @@ def test_can_put_simple_text_resource():
 def test_can_post_simple_text_resource():
     resource = Resource("http://localhost:8080/hello")
     response = resource.post("fred")
-    assert response.is_text
+    assert isinstance(response, TextResponse)
     content = response.read().decode(response.encoding)
     assert content == "hello, world and fred"
 
@@ -110,7 +121,7 @@ def test_can_post_simple_text_resource():
 def test_can_delete_simple_text_resource():
     resource = Resource("http://localhost:8080/hello")
     response = resource.delete()
-    assert response.is_text
+    assert isinstance(response, TextResponse)
     content = response.read().decode(response.encoding)
     assert content == "goodbye, cruel world"
 
@@ -118,7 +129,7 @@ def test_can_delete_simple_text_resource():
 def test_can_send_header():
     resource = Resource("http://localhost:8080/hello")
     response = resource.put("fred", headers={"X-Upper-Case": True})
-    assert response.is_text
+    assert isinstance(response, TextResponse)
     content = response.read().decode(response.encoding)
     assert content == "HELLO, FRED"
 
@@ -128,7 +139,7 @@ def test_can_get_multi_line_text_resource():
     expected_lines = LOREM_IPSUM.splitlines()
     with resource.get() as response:
         response.chunk_size = 37
-        assert response.is_text
+        assert isinstance(response, TextResponse)
         for line in response:
             assert line == expected_lines.pop(0)
 
@@ -138,7 +149,7 @@ def test_can_get_multi_line_cyrillic_text_resource():
     expected_lines = WAR_AND_PEACE.splitlines()
     with resource.get() as response:
         response.chunk_size = 37
-        assert response.is_text
+        assert isinstance(response, TextResponse)
         for line in response:
             assert line == expected_lines.pop(0)
 
@@ -148,7 +159,7 @@ def test_can_get_multi_line_hebrew_text_resource():
     expected_lines = GENESIS.splitlines()
     with resource.get() as response:
         response.chunk_size = 37
-        assert response.is_text
+        assert isinstance(response, TextResponse)
         for line in response:
             assert line == expected_lines.pop(0)
 
@@ -158,7 +169,7 @@ def test_can_get_big_resource_with_small_chunk_size():
     expected_lines = LOREM_IPSUM.splitlines()
     with resource.get() as response:
         response.chunk_size = 10
-        assert response.is_text
+        assert isinstance(response, TextResponse)
         for line in response:
             assert line == expected_lines.pop(0)
 
@@ -166,14 +177,24 @@ def test_can_get_big_resource_with_small_chunk_size():
 def test_can_get_simple_json_resource():
     resource = Resource("http://localhost:8080/object")
     with resource.get() as response:
-        assert response.is_json
+        assert isinstance(response, JSONResponse)
         assert assembled(response) == OBJECT
+
+
+def test_can_get_simple_json_resource_with_caching():
+    resource = Resource("http://localhost:8080/object")
+    with resource.get(cache=True) as response:
+        assert isinstance(response, JSONResponse)
+        assert not response.consumed
+        assert response.content == OBJECT
+        assert response.consumed
+        assert response.content == OBJECT
 
 
 def test_can_get_multi_object_json_resource():
     resource = Resource("http://localhost:8080/person/")
     with resource.get() as response:
-        assert response.is_json
+        assert isinstance(response, JSONResponse)
         for (name,), person in grouped(response):
             assert assembled(person) == PEOPLE[name]
 
@@ -181,15 +202,15 @@ def test_can_get_multi_object_json_resource():
 def test_can_get_block_json_resource():
     resource = Resource("http://localhost:8080/object")
     with resource.get() as response:
-        assert response.is_json
-        assert response.json == OBJECT
+        assert isinstance(response, JSONResponse)
+        assert response.content == OBJECT
 
 
 def test_can_use_resource_with_template_uri():
     resource_tmpl = ResourceTemplate("http://localhost:8080/person/{name}")
     for name in PEOPLE.keys():
         with resource_tmpl.expand(name=name).get() as response:
-            assert response.is_json
+            assert isinstance(response, JSONResponse)
             assert assembled(response) == PEOPLE[name]
 
 
@@ -214,24 +235,13 @@ def test_can_set_product_in_user_agent():
     test_product = ("FooBar", "1.2.3")
     resource = Resource("http://localhost:8080/user_agent")
     with resource.get(product=test_product) as response:
-        assert response.is_text
-        bits = response.read().decode(response.encoding).split()
+        assert isinstance(response, TextResponse)
+        bits = response.content.split()
         received_product = tuple(bits[0].split("/"))
         assert received_product == test_product
 
 
-def test_cannot_use_unknown_scheme():
-    resource = Resource("xxxx://www.example.com/")
-    try:
-        resource.get()
-    except ValueError:
-        assert True
-    else:
-        assert False
-
-
-def test_can_get_remote_resource():
-    try:
-        Resource("http://www.timeapi.org/utc/now").get()
-    except:
-        pass
+def test_auto_populate_uri_scheme():
+    resource = Resource("nigelsmall.com")
+    response = resource.get()
+    assert response.uri == "http://nigelsmall.com"
